@@ -1,0 +1,265 @@
+services:
+  # ===== INFRASTRUCTURE SERVICES =====
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: crypto-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+    networks:
+      - crypto-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: crypto-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_DELETE_TOPIC_ENABLE: 'true'
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - crypto-network
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  mongodb:
+    image: mongo:6.0
+    container_name: crypto-mongodb
+    restart: always
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGODB_USER:-cryptovizuser}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGODB_PASSWORD:-cryptovizpass}
+      MONGO_INITDB_DATABASE: ${MONGODB_DATABASE:-cryptoviz}
+    volumes:
+      - mongodb-data:/data/db
+    networks:
+      - crypto-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    container_name: crypto-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    command: redis-server --requirepass ${REDIS_PASSWORD:-redis_password}
+    volumes:
+      - redis-data:/data
+    networks:
+      - crypto-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ===== DATA COLLECTION SERVICE (Python + asyncio + ccxt) =====
+  data-collector:
+    build:
+      context: ./services/data-collector
+      dockerfile: Dockerfile
+    container_name: crypto-data-collector
+    restart: always
+    ports:
+      - "${DATA_COLLECTOR_PORT:-8001}:8000"
+    environment:
+      - PYTHONPATH=/app
+      - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:29092}
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-redis_password}
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_SECRET=${BINANCE_SECRET}
+      - COINBASE_API_KEY=${COINBASE_API_KEY}
+      - COINBASE_SECRET=${COINBASE_SECRET}
+      - COLLECTION_INTERVAL=${COLLECTION_INTERVAL:-30}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./shared:/app/shared:ro
+    networks:
+      - crypto-network
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ===== DATA PROCESSING SERVICE (Python + pandas) =====
+  data-processor:
+    build:
+      context: ./services/data-processor
+      dockerfile: Dockerfile
+    container_name: crypto-data-processor
+    restart: always
+    ports:
+      - "${DATA_PROCESSOR_PORT:-8002}:8002"
+    environment:
+      - PYTHONPATH=/app
+      - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:29092}
+      - MONGODB_URI=${MONGODB_URI:-mongodb://cryptovizuser:cryptovizpass@mongodb:27017/cryptoviz?authSource=admin}
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-redis_password}
+      - PROCESSING_WINDOW_SHORT=${PROCESSING_WINDOW_SHORT:-300}
+      - PROCESSING_WINDOW_MEDIUM=${PROCESSING_WINDOW_MEDIUM:-3600}
+      - PROCESSING_WINDOW_LONG=${PROCESSING_WINDOW_LONG:-86400}
+      - ALERT_THRESHOLD=${ALERT_THRESHOLD:-5}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      data-collector:
+        condition: service_healthy
+    volumes:
+      - ./shared:/app/shared:ro
+    networks:
+      - crypto-network
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ===== API BACKEND (Node.js + Express) =====
+  api-backend:
+    build:
+      context: ./services/api-backend
+      dockerfile: Dockerfile
+    container_name: crypto-api-backend
+    restart: always
+    ports:
+      - "${API_BACKEND_PORT:-3002}:3000"
+    environment:
+      - NODE_ENV=${NODE_ENV:-development}
+      - PORT=3000
+      - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:29092}
+      - MONGODB_URI=${MONGODB_URI:-mongodb://cryptovizuser:cryptovizpass@mongodb:27017/cryptoviz?authSource=admin}
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-redis_password}
+      - JWT_SECRET=${JWT_SECRET:-your_jwt_secret}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      data-processor:
+        condition: service_healthy
+    volumes:
+      - ./shared:/app/shared:ro
+    networks:
+      - crypto-network
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ===== FRONTEND (React + WebSockets) =====
+  frontend:
+    build:
+      context: ./services/frontend
+      dockerfile: Dockerfile
+    container_name: crypto-frontend
+    restart: always
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    environment:
+      - NODE_ENV=${NODE_ENV:-development}
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:3002}
+      - NEXT_PUBLIC_WS_URL=${NEXT_PUBLIC_WS_URL:-ws://localhost:3002}
+      - NEXT_PUBLIC_APP_NAME=CRYPTO VIZ
+    depends_on:
+      - api-backend
+    networks:
+      - crypto-network
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000 > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ===== KAFKA TOPIC INITIALIZATION =====
+  kafka-init:
+    image: confluentinc/cp-kafka:latest
+    container_name: crypto-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - crypto-network
+    command: |
+      bash -c "
+        echo 'Creating Kafka topics...'
+        kafka-topics --create --topic crypto-raw-data --bootstrap-server kafka:29092 --replication-factor 1 --partitions 3 --if-not-exists
+        kafka-topics --create --topic crypto-processed-data --bootstrap-server kafka:29092 --replication-factor 1 --partitions 3 --if-not-exists
+        kafka-topics --create --topic crypto-alerts --bootstrap-server kafka:29092 --replication-factor 1 --partitions 1 --if-not-exists
+        kafka-topics --create --topic crypto-analytics --bootstrap-server kafka:29092 --replication-factor 1 --partitions 2 --if-not-exists
+        echo 'Kafka topics created successfully!'
+        kafka-topics --list --bootstrap-server kafka:29092
+      "
+
+# ===== VOLUMES =====
+volumes:
+  kafka-data:
+    driver: local
+  zookeeper-data:
+    driver: local
+  zookeeper-logs:
+    driver: local
+  mongodb-data:
+    driver: local
+  redis-data:
+    driver: local
+
+# ===== NETWORKS =====
+networks:
+  crypto-network:
+    driver: bridge
+    name: ${DOCKER_NETWORK:-crypto-viz-network}
